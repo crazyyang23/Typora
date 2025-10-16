@@ -1,0 +1,642 @@
+## 一、环境准备
+
+### 1.1 节点规划
+
+| 主机名   | IP地址      | 角色                  | 推荐配置          |
+| :------- | :---------- | :-------------------- | :---------------- |
+| messql01 | 192.168.1.1 | 主节点（初始主副本）  | 16核CPU, 32GB内存 |
+| messql02 | 192.168.1.2 | 同步辅助副本          | 16核CPU, 32GB内存 |
+| messql03 | 192.168.1.3 | 异步辅助副本/只读节点 | 8核CPU, 16GB内存  |
+
+### 1.2 共享存储规划（可选）
+
+图表
+
+代码
+
+
+
+
+
+
+
+下载
+
+读写请求同步复制异步复制心跳检测心跳检测应用服务器AG侦听器:192.168.1.100messql01messql02messql03
+
+## 二、系统级配置（所有节点执行）
+
+### 2.1 基础环境配置
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+# 禁用SELinux（所有节点）
+sudo setenforce 0
+sudo sed -i 's/^SELINUX=.*/SELINUX=disabled/g' /etc/selinux/config
+
+# 时间同步配置（使用主节点作为时间源）
+if [ "$HOSTNAME" = "messql01" ]; then
+    sudo yum install -y chrony
+    sudo sed -i '/^server/d' /etc/chrony.conf
+    echo "server 0.centos.pool.ntp.org iburst" | sudo tee -a /etc/chrony.conf
+    sudo systemctl enable --now chronyd
+else
+    sudo sed -i '/^server/d' /etc/chrony.conf
+    echo "server messql01 iburst" | sudo tee -a /etc/chrony.conf
+    sudo systemctl restart chronyd
+fi
+
+# 验证时间同步
+chronyc sources -v
+chronyc tracking
+```
+
+### 2.2 防火墙配置
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+# 开放必要端口（所有节点）
+sudo firewall-cmd --permanent --add-port=1433/tcp   # SQL Server
+sudo firewall-cmd --permanent --add-port=5022/tcp   # AG端点
+sudo firewall-cmd --permanent --add-port=2224/tcp   # Pacemaker
+sudo firewall-cmd --permanent --add-port=3121/tcp   # Pacemaker
+sudo firewall-cmd --permanent --add-port=5405/udp   # Corosync
+sudo firewall-cmd --reload
+```
+
+## 三、SQL Server安装与配置
+
+### 3.1 安装SQL Server 2019（所有节点）
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+# 添加微软仓库
+sudo curl -o /etc/yum.repos.d/mssql-server.repo https://packages.microsoft.com/config/rhel/8/mssql-server-2019.repo
+
+# 安装主程序
+sudo yum install -y mssql-server
+
+# 运行初始配置
+sudo /opt/mssql/bin/mssql-conf setup
+```
+
+配置过程中需要：
+
+1. 选择版本（生产环境选择Enterprise或Standard）
+2. 接受许可协议
+3. 设置SA密码（建议复杂度：至少12位含大小写字母、数字和特殊字符）
+
+### 3.2 启用HADR功能（所有节点）
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+sudo /opt/mssql/bin/mssql-conf set hadr.hadrenabled 1
+sudo systemctl restart mssql-server
+
+# 验证HADR状态
+sqlcmd -S localhost -U SA -P 'YourStrongPassword' -Q "SELECT SERVERPROPERTY('IsHadrEnabled')"
+```
+
+### 3.3 安装高可用组件（所有节点）
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+sudo yum install -y mssql-server-ha
+```
+
+## 四、证书配置
+
+### 4.1 在主节点创建证书
+
+sql
+
+
+
+复制
+
+
+
+下载
+
+```
+USE master;
+GO
+
+-- 创建数据库主密钥（如果不存在）
+IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = '##MS_DatabaseMasterKey##')
+    CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'MasterKey@Pass123';
+
+-- 创建端点证书
+CREATE CERTIFICATE dbm_certificate
+    WITH SUBJECT = 'dbm_endpoint_cert',
+    EXPIRY_DATE = '2025-12-31';
+GO
+
+-- 备份证书（包含私钥）
+BACKUP CERTIFICATE dbm_certificate
+TO FILE = '/var/opt/mssql/data/dbm_certificate.cer'
+WITH PRIVATE KEY (
+    FILE = '/var/opt/mssql/data/dbm_certificate.pvk',
+    ENCRYPTION BY PASSWORD = 'PrivateKey@Secure456'
+);
+GO
+```
+
+### 4.2 分发证书到所有节点
+
+
+
+```
+# 从主节点复制到其他节点
+for node in messql02 messql03; do
+    sudo scp /var/opt/mssql/data/dbm_certificate.* $node:/var/opt/mssql/data/
+    ssh $node "sudo chown mssql:mssql /var/opt/mssql/data/dbm_certificate.*"
+    ssh $node "sudo chmod 600 /var/opt/mssql/data/dbm_certificate.*"
+done
+```
+
+### 4.3 在所有节点创建证书
+
+
+
+```
+
+USE master;
+GO
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'PrivateKey@Secure456'
+CREATE CERTIFICATE dbm_certificate
+    FROM FILE = '/var/opt/mssql/data/dbm_certificate.cer'
+    WITH PRIVATE KEY (
+        FILE = '/var/opt/mssql/data/dbm_certificate.pvk',
+        DECRYPTION BY PASSWORD = 'PrivateKey@Secure456'
+    );
+GO
+```
+
+## 五、配置可用性组
+
+### 5.1 创建端点（所有节点）
+
+
+
+```
+CREATE ENDPOINT [Hadr_endpoint]
+    STATE = STARTED
+    AS TCP (LISTENER_PORT = 5022)
+    FOR DATABASE_MIRRORING (
+        ROLE = ALL,
+        AUTHENTICATION = CERTIFICATE dbm_certificate,
+        ENCRYPTION = REQUIRED ALGORITHM AES
+    );
+GO
+```
+
+### 5.2 在主节点创建可用性组
+
+
+
+```
+CREATE AVAILABILITY GROUP [AG_Prod]
+    WITH (
+        CLUSTER_TYPE = EXTERNAL,
+        DB_FAILOVER = ON,
+        DTC_SUPPORT = NONE
+    )
+    FOR REPLICA ON 
+        N'messql01' WITH (
+            ENDPOINT_URL = N'tcp://messql01:5022',
+            AVAILABILITY_MODE = SYNCHRONOUS_COMMIT,
+            FAILOVER_MODE = EXTERNAL,
+            SEEDING_MODE = AUTOMATIC,
+            PRIMARY_ROLE (READ_WRITE_ROUTING_LIST = ('messql01','messql02')),
+            SECONDARY_ROLE (ALLOW_CONNECTIONS = READ_ONLY)
+        ),
+        N'messql02' WITH (
+            ENDPOINT_URL = N'tcp://messql02:5022',
+            AVAILABILITY_MODE = SYNCHRONOUS_COMMIT,
+            FAILOVER_MODE = EXTERNAL,
+            SEEDING_MODE = AUTOMATIC,
+            PRIMARY_ROLE (READ_WRITE_ROUTING_LIST = ('messql01','messql02')),
+            SECONDARY_ROLE (ALLOW_CONNECTIONS = READ_ONLY)
+        ),
+        N'messql03' WITH (
+            ENDPOINT_URL = N'tcp://messql03:5022',
+            AVAILABILITY_MODE = ASYNCHRONOUS_COMMIT,
+            FAILOVER_MODE = MANUAL,
+            SEEDING_MODE = AUTOMATIC,
+            SECONDARY_ROLE (ALLOW_CONNECTIONS = READ_ONLY)
+        );
+GO
+```
+
+### 5.3 将辅助节点加入AG
+
+**在messql02和messql03上执行**：
+
+sql
+
+
+
+复制
+
+
+
+下载
+
+```
+ALTER AVAILABILITY GROUP [AG_Prod] JOIN;
+GO
+
+-- 授予权限
+ALTER AVAILABILITY GROUP [AG_Prod] GRANT CREATE ANY DATABASE;
+GO
+```
+
+## 六、Pacemaker集群配置
+
+### 6.1 安装集群组件（所有节点）
+
+
+
+```
+sudo yum install -y pacemaker pcs fence-agents-all
+sudo systemctl enable --now pcsd
+```
+
+### 6.2 设置hacluster密码（所有节点）
+
+
+
+```
+echo "P@ssw0rd!Cluster" | sudo passwd --stdin hacluster
+```
+
+### 6.3 配置集群（在messql01上执行）
+
+
+
+```
+# 认证节点
+sudo pcs cluster auth messql01 messql02 messql03 -u hacluster -p 'P@ssw0rd!Cluster'
+
+# 创建集群
+sudo pcs cluster setup --name sqlcluster messql01 messql02 messql03
+
+# 启动集群
+sudo pcs cluster start --all
+sudo pcs cluster enable --all
+```
+
+### 6.4 配置仲裁选项
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+# 配置三节点仲裁
+sudo pcs quorum device add model net host=192.168.1.100 algorithm=ffsplit
+sudo pcs property set no-quorum-policy=freeze
+```
+
+### 6.5 创建AG资源
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+sudo pcs resource create ag_cluster ocf:mssql:ag \
+    ag_name=AG_Prod \
+    meta failure-timeout=60s \
+    op start timeout=120s \
+    op stop timeout=120s \
+    op monitor interval=30s timeout=60s \
+    --master meta notify=true
+
+# 配置虚拟IP资源
+sudo pcs resource create virtualip ocf:heartbeat:IPaddr2 \
+    ip=192.168.1.100 cidr_netmask=24 \
+    op monitor interval=30s
+```
+
+### 6.6 配置资源约束
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+# 配置colocation约束
+sudo pcs constraint colocation add virtualip ag_cluster-master INFINITY with-rsc-role=Master
+
+# 配置顺序约束
+sudo pcs constraint order promote ag_cluster-master then start virtualip
+
+# 配置位置偏好
+sudo pcs constraint location ag_cluster-master prefers messql01=200 messql02=100 messql03=50
+```
+
+## 七、侦听器配置
+
+### 7.1 创建可用性组侦听器
+
+sql
+
+
+
+复制
+
+
+
+下载
+
+```
+USE master;
+GO
+
+ALTER AVAILABILITY GROUP [AG_Prod]
+ADD LISTENER 'AG_Listener' (
+    WITH IP (
+        (N'192.168.1.100', N'255.255.255.0')
+    ),
+    PORT = 1433);
+GO
+```
+
+### 7.2 验证侦听器
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+# 测试连接
+sqlcmd -S AG_Listener -U SA -P 'YourPassword' -Q "SELECT @@SERVERNAME"
+
+# 查看路由配置
+SELECT 
+    replica_server_name,
+    read_only_routing_url
+FROM sys.availability_replicas
+WHERE replica_server_name IN ('messql01', 'messql02', 'messql03');
+```
+
+## 八、数据库部署与验证
+
+### 8.1 创建测试数据库
+
+sql
+
+
+
+复制
+
+
+
+下载
+
+```
+-- 在主节点执行
+CREATE DATABASE AG_TestDB;
+GO
+
+ALTER DATABASE AG_TestDB SET RECOVERY FULL;
+GO
+
+BACKUP DATABASE AG_TestDB TO DISK = '/var/opt/mssql/backup/AG_TestDB.bak';
+GO
+
+-- 将数据库加入AG
+ALTER AVAILABILITY GROUP [AG_Prod] ADD DATABASE [AG_TestDB];
+GO
+```
+
+### 8.2 验证数据同步
+
+sql
+
+
+
+复制
+
+
+
+下载
+
+```
+-- 在主节点插入数据
+USE AG_TestDB;
+GO
+CREATE TABLE TestTable (ID INT PRIMARY KEY, Name NVARCHAR(50));
+INSERT INTO TestTable VALUES (1, 'Primary Node');
+GO
+
+-- 在辅助节点查询（只读）
+-- 在messql02或messql03上执行：
+USE AG_TestDB;
+GO
+SELECT * FROM TestTable;  -- 应能看到主节点插入的数据
+```
+
+## 九、维护操作
+
+### 9.1 手动故障转移
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+# 将主角色转移到messql02
+sudo pcs resource move ag_cluster-master messql02 --master
+
+# 清理迁移约束（转移后必须执行）
+sudo pcs resource clear ag_cluster-master
+```
+
+### 9.2 节点维护模式
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+# 将节点置于维护模式
+sudo pcs node maintenance messql03
+
+# 退出维护模式
+sudo pcs node unmaintenance messql03
+```
+
+## 十、监控与排错
+
+### 10.1 监控脚本
+
+**AG状态检查脚本**：
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+#!/bin/bash
+# ag_monitor.sh
+
+sqlcmd -S localhost -U SA -P 'YourPassword' -Q "
+SELECT 
+    ag.name AS [AG Name],
+    ar.replica_server_name,
+    ars.connected_state_desc,
+    ars.synchronization_health_desc,
+    db_name(drs.database_id) AS [Database],
+    drs.synchronization_state_desc,
+    drs.log_send_queue_size,
+    drs.redo_queue_size
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_availability_replica_states ars ON ar.replica_id = ars.replica_id
+LEFT JOIN sys.dm_hadr_database_replica_states drs ON ars.replica_id = drs.replica_id;
+"
+```
+
+### 10.2 关键日志位置
+
+| 日志类型           | 路径                          |
+| :----------------- | :---------------------------- |
+| SQL Server错误日志 | /var/opt/mssql/log/errorlog   |
+| Pacemaker日志      | /var/log/cluster/corosync.log |
+| 资源代理日志       | /var/log/messages             |
+
+### 10.3 常见问题处理
+
+**问题1：同步延迟高**
+
+sql
+
+
+
+复制
+
+
+
+下载
+
+```
+-- 检查延迟情况
+SELECT 
+    ar.replica_server_name,
+    db_name(drs.database_id) AS database_name,
+    drs.log_send_queue_size,
+    drs.redo_queue_size,
+    drs.last_commit_time
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id;
+```
+
+**问题2：资源启动失败**
+
+bash
+
+
+
+复制
+
+
+
+下载
+
+```
+# 查看资源失败原因
+sudo pcs resource debug-start ag_cluster
+sudo journalctl -xe | grep -A 20 -B 20 "ag_cluster"
+```
+
+本指南提供了三节点SQL Server 2019 AlwaysOn高可用集群的完整配置流程，实际生产部署时应根据具体环境调整参数，并建议在测试环境充分验证后再进行生产部署。

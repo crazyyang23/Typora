@@ -1,0 +1,123 @@
+Dapr 应用实际并发数查看问题处理手册
+
+一、手册目的
+
+本手册旨在为相关技术人员提供查看 Dapr 应用实际并发数的详细方法和流程，帮助其准确掌握应用的并发情况，以便针对性地调整限流策略，保障应用的稳定运行。
+
+二、适用范围
+
+本手册适用于所有使用 Dapr 框架开发和部署的应用，相关技术人员在需要了解 Dapr 应用实际并发数时可参考本手册。
+
+三、查看 Dapr 应用实际并发数的方法
+
+（一）使用 Dapr 内置指标
+
+1. **启用指标收集**：启动 Dapr 时，添加--enable-metrics参数（默认已启用），命令如下：
+
+TypeScript取消自动换行复制dapr run --app-id myapp --enable-metrics=true -- python3 app.py
+
+1. **查询关键指标**：Dapr 会暴露与并发相关的指标，可通过 Prometheus 或 Grafana 等工具查询。关键指标包括：
+
+- dapr_runtime_http_requests_in_flight：当前正在处理的 HTTP 请求数量
+
+- dapr_runtime_method_concurrency：按方法统计的并发请求数
+
+例如，在 Prometheus 中使用以下 PromQL 查询按应用统计的并发请求数：
+
+TypeScript取消自动换行复制sum(dapr_runtime_http_requests_in_flight) by (app_id)
+
+（二）应用层日志记录
+
+在应用代码中添加日志记录，统计同时处理的请求数。以 Python 为例：
+
+TypeScript取消自动换行复制# Python示例：使用计数器跟踪并发请求import threadingconcurrency_counter = 0counter_lock = threading.Lock()def handle_request():    global concurrency_counter    with counter_lock:        concurrency_counter += 1        current_concurrency = concurrency_counter        print(f"Current concurrency: {current_concurrency}")        # 处理请求逻辑...        with counter_lock:        concurrency_counter -= 1
+
+（三）查看 Dapr Sidecar 日志
+
+Dapr Sidecar 的日志会记录请求的处理情况，可通过分析日志估算并发数。查看日志的命令如下：
+
+TypeScript取消自动换行复制dapr logs -a myapp
+
+在日志中关注请求处理时间和频率，记录每个请求的开始和结束时间，统计同一时刻活跃的请求数。
+
+（四）集成 APM 工具
+
+结合应用性能监控（APM）工具，如 Jaeger、Zipkin 或 Skywalking。以 Jaeger 为例：
+
+1. 启动 Dapr 时配置 Jaeger，命令如下：
+
+TypeScript取消自动换行复制dapr run --app-id myapp --tracing-enabled=true --tracing-exporter jaeger -- python3 app.py
+
+1. 在 Jaeger UI 中查看并发请求的跟踪信息，统计同时活跃的请求数。
+
+（五）容器平台监控
+
+1. **Kubernetes 环境**
+
+- 查看 Pod CPU / 内存使用情况，命令：kubectl top pods
+
+- 查看应用日志，命令：kubectl logs <pod-name>
+
+1. **Docker 环境**
+
+- 查看容器资源使用，命令：docker stats <container-id>
+
+- 查看应用日志，命令：docker logs <container-id>
+
+通过容器的 CPU、内存等资源使用情况，间接推断并发数。
+
+（六）自定义中间件统计
+
+在应用代码中添加中间件，统计并发请求数。以 Flask 应用为例：
+
+TypeScript取消自动换行复制from flask import Flaskimport threadingapp = Flask(__name__)active_requests = 0lock = threading.Lock()@app.before_requestdef before_request():    global active_requests    with lock:        active_requests += 1@app.after_requestdef after_request(response):    global active_requests    with lock:        active_requests -= 1    return response@app.route('/metrics')def metrics():    return f"active_requests: {active_requests}"
+
+四、并发控制配置的验证与调优
+
+（一）压力测试验证
+
+使用工具（如wrk、hey）进行压力测试，验证并发控制配置是否生效。以wrk为例，发起 200 并发请求的命令如下：
+
+TypeScript取消自动换行复制wrk -t10 -c200 -d30s http:*//localhost:3000/*
+
+观察响应情况和应用资源消耗，确认是否符合预期并发限制。
+
+（二）调优建议
+
+根据查看的实际并发数和压力测试结果，结合应用的类型（CPU 密集型或 IO 密集型）调整并发控制参数。
+
+- 对于 CPU 密集型应用，建议将并发数设置为 CPU 核心数的 1-2 倍。
+
+- 对于 IO 密集型应用，并发数可以设置得更高，如 10-100，具体数值根据实际性能测试结果确定。
+
+五、常见问题及解决方法
+
+（一）无法获取 Dapr 内置指标
+
+1. 检查是否启用了指标收集，确认启动 Dapr 时是否添加了--enable-metrics参数，若未添加，重新启动并添加该参数。
+
+1. 检查 Prometheus 或 Grafana 等工具的配置是否正确，确保能够正常连接到 Dapr 的指标暴露端口。
+
+（二）应用日志中并发数统计不准确
+
+1. 检查应用代码中计数器的实现是否正确，确保在请求处理的开始和结束都正确地对计数器进行增减操作，且使用了合适的锁机制防止并发问题。
+
+1. 查看日志输出是否完整，是否存在日志丢失的情况，若有，检查日志配置。
+
+（三）容器平台监控指标与实际并发数不符
+
+1. 考虑资源使用与并发数之间的关联性可能存在偏差，结合其他查看方法（如 Dapr 内置指标、应用日志）综合判断。
+
+1. 检查容器的资源限制是否合理，若资源限制过低，可能会影响应用的并发处理能力，导致监控指标不准确。
+
+六、总结
+
+推荐采用以下组合方式查看 Dapr 应用实际并发数：
+
+1. **Dapr 指标 + Prometheus**：获取系统级并发统计。
+
+1. **应用日志 + APM**：跟踪具体请求的并发处理情况。
+
+1. **容器监控**：从资源使用层面间接推断并发压力。
+
+通过多维度监控，可以准确掌握 Dapr 应用的实际并发情况，并针对性地调整限流策略，保障应用的稳定运行。

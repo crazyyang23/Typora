@@ -1,0 +1,224 @@
+### **Dapr 问题处理手册**
+
+#### **1. 大数据量查询失败**
+
+**可能原因**：
+
+
+
+- Dapr 默认 HTTP/gRPC 超时（60 秒）
+- 消息大小限制（默认 4MB）
+- 下游服务或 Dapr 实例资源不足
+- 状态存储组件自身限制（如 Redis 单 key 512MB 限制）
+
+
+
+**解决方法**：
+
+
+
+1. 增加超时设置
+
+   ：
+
+   bash
+
+   ```bash
+   dapr invoke --app-id myapp --method getdata --timeout 300s
+   ```
+
+2. 修改消息大小限制
+
+   （
+
+   ```
+   config.yaml
+   ```
+
+   ）：
+
+   yaml
+
+   ```yaml
+   spec:
+     http:
+       maxRequestBodySize: 100  # 单位：MB
+   ```
+
+3. **优化查询逻辑**：实现分页 / 分批处理，避免一次性查询全量数据
+
+4. **增加资源配额**：提升 Dapr 边车和应用容器的内存 / CPU 限制
+
+#### **2. 配置文件修改指南**
+
+**自定义配置文件**（`config.yaml`）：
+
+
+
+yaml
+
+```yaml
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: my-config
+spec:
+  tracing:
+    samplingRate: "1"  # 采样率
+  http:
+    maxRequestBodySize: 100  # 请求体最大大小(MB)
+  metrics:
+    enabled: true      # 启用指标收集
+```
+
+
+
+**启动时应用配置**：
+
+
+
+bash
+
+```bash
+dapr run --app-id myapp --config config.yaml --app-port 3000 python app.py
+```
+
+
+
+**Kubernetes 环境**：
+
+
+
+bash
+
+```bash
+kubectl apply -f config.yaml
+```
+
+#### **3. 核心配置参数详解**
+
+| 参数组      | 关键参数                 | 说明                                    |
+| ----------- | ------------------------ | --------------------------------------- |
+| **tracing** | `samplingRate`           | 追踪采样比例（0.0-1.0）                 |
+|             | `zipkin.endpointAddress` | Zipkin 服务地址                         |
+| **http**    | `maxRequestBodySize`     | 请求体最大大小（MB）                    |
+| **actors**  | `actorIdleTimeout`       | Actor 空闲超时时间                      |
+| **metrics** | `enabled`                | 是否启用指标收集                        |
+|             | `prometheus.port`        | Prometheus 指标端口                     |
+| **logging** | `level`                  | 日志级别（debug/info/warn/error/fatal） |
+|             | `outputJSON`             | 是否输出 JSON 格式                      |
+
+#### **4. Metrics 配置详解**
+
+**关键参数**：
+
+
+
+yaml
+
+```yaml
+spec:
+  metrics:
+    enabled: true             # 启用指标收集
+    prometheus:
+      port: 9090              # 指标端口
+      path: "/metrics"        # 指标路径
+    labels:                   # 添加自定义标签
+      env: "prod"
+    include: ["dapr_runtime*"]  # 包含的指标前缀
+    exclude: ["dapr_client*"]   # 排除的指标前缀
+```
+
+
+
+**常用指标分类**：
+
+
+
+- `dapr_runtime_*`：运行时指标（如 Actor 调用次数）
+- `dapr_api_*`：API 请求指标（如 HTTP/gRPC 请求数）
+- `dapr_component_*`：组件操作指标（如状态存储操作）
+
+#### **5. 日志记录配置**
+
+**配置示例**（`config.yaml`）：
+
+
+
+yaml
+
+```yaml
+spec:
+  logging:
+    level: "info"             # 日志级别
+    outputJSON: true          # JSON 格式输出
+    sampling:                 # 日志采样（减少日志量）
+      initial: 100
+      thereafter: 10
+```
+
+
+
+**Kubernetes 环境配置**：
+
+
+
+yaml
+
+```yaml
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: logging-config
+spec:
+  logging:
+    level: "warn"
+```
+
+#### **6. 常见问题排查步骤**
+
+1. 查看 Dapr 日志
+
+   ```bash
+   dapr logs <app-id>
+   ```
+
+2. 检查配置是否生效
+
+   ```bash
+   dapr status
+   ```
+
+3. **监控资源使用**：检查 Dapr 边车和应用的 CPU / 内存指标
+
+4. **测试边界条件**：验证小数据量请求是否正常
+
+5. **启用追踪**：通过 Zipkin 或 Jaeger 分析请求链路
+
+#### **7. 性能优化建议**
+
+- 生产环境
+
+  ：
+
+  - 设置 `logging.level: "warn"` 减少日志开销
+  - 配置 `metrics.include/exclude` 过滤不必要的指标
+  - 启用 `mtls.enabled: true` 增强安全性
+
+- 大数据场景
+
+  ：
+
+  - 实现客户端分页查询
+  - 增加 `http.maxRequestBodySize`
+  - 使用支持大数据的存储组件（如 MongoDB）
+
+#### **8. 参考文档**
+
+- Dapr 官方文档：https://docs.dapr.io/
+- 配置参考：https://docs.dapr.io/reference/config-reference/
+- 常见问题：https://docs.dapr.io/operations/troubleshooting/
+
+
+
+通过本手册，你可以快速定位和解决 Dapr 应用中的常见问题，合理配置关键参数以满足不同场景需求。
